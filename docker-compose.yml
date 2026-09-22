@@ -1,0 +1,29 @@
+services:
+  api:
+    build: .
+    image: coldchain-audit:latest
+    container_name: coldchain-audit
+    labels:
+      org.opencontainers.image.title: "coldchain-audit"
+      org.opencontainers.image.description: "冷链温度合规审计 API（报告封存 seal/verify + 批次人工复核 review）"
+      org.opencontainers.image.version: "1.2.0"
+    ports:
+      - "8000:8000"
+    environment:
+      COLDCHAIN_DB_PATH: /data/coldchain.db
+      # 可选：覆盖默认滞回阈值与采样间隔上限
+      # COLDCHAIN_DEFAULT_HYSTERESIS: "0.5"
+      # COLDCHAIN_DEFAULT_MAX_INTERVAL: "900"
+    volumes:
+      # 批次、读数、片段、封存摘要（batch_seals）与复核事件（review_events）均持久化在此卷
+      - coldchain-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  coldchain-data:
