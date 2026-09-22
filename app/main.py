@@ -20,6 +20,8 @@ from .schemas import (
     BatchReport,
     BatchReview,
     BatchSeal,
+    HandoffCheckCreate,
+    HandoffCheckReport,
     ReviewCreate,
     ReviewEventOut,
     SealVerification,
@@ -35,14 +37,16 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="冷链温度合规审计 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交按批次组织的 ISO 时间戳温度读数，服务端排序后使用滞回阈值"
         "识别连续超温事件，并将超过采样间隔上限的缺测切成独立片段；"
         "支持对审计报告按固定字段顺序生成 canonical JSON 并以 SHA-256"
         "封存摘要（seal），随后可重新计算摘要进行一致性校验（verify）；"
         "另支持批次人工复核工作流（pending → approved/rejected → "
-        "reopen），复核事件追加留痕，不改动审计报告与封存数据。"
+        "reopen），复核事件追加留痕，不改动审计报告与封存数据；"
+        "还支持按运输顺序对多个批次做只读的运输交接连续性检查"
+        "（POST /handoffs/check），报告缺口、重叠与交接点两侧片段类型。"
     ),
     lifespan=lifespan,
 )
@@ -239,3 +243,44 @@ def get_batch_review(
             detail=f"batch not found: {batch_ref}",
         )
     return review
+
+
+@app.post(
+    "/handoffs/check",
+    response_model=HandoffCheckReport,
+    tags=["handoffs"],
+    summary="运输交接连续性检查（只读，不改变报告/封存/复核数据）",
+)
+def check_handoffs(
+    payload: HandoffCheckCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """按运输顺序逐对相邻批次校验交接连续性。
+
+    读取各批次**已审计时间轴**（start_time/end_time 与首末片段类型），
+    对相邻批次计算交接间隔 ``gap_seconds``（下游 start_time − 上游
+    end_time）：正数为缺口、0 为首尾相接、负数为重叠。缺口**严格超过**
+    ``max_handoff_seconds``，或上游末段 / 下游首段任一为 ``missing`` 时，
+    该相邻对标记 ``handoff_issue``；``route_compliant`` 当且仅当所有相邻
+    对均无问题。重叠只如实报告，不单独判问题。
+
+    整个接口只读：不改动审计报告、seal/verify 与复核数据。
+    列表不足两项或含重复批次返回 422；任一引用不存在返回 404。
+    """
+
+    try:
+        return crud.check_handoffs(
+            conn,
+            payload.batch_refs,
+            max_handoff_seconds=payload.max_handoff_seconds,
+        )
+    except crud.HandoffBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"batch not found: {exc}",
+        )
+    except crud.HandoffDuplicateTargetError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"batch_refs resolve to the same batch: {exc}",
+        )

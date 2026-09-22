@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Annotated
 
 from pydantic import (
     BaseModel,
@@ -255,6 +256,121 @@ class BatchReview(BaseModel):
     external_ref: str
     status: ReviewStatus
     events: list[ReviewEventOut]
+
+
+# ---- 运输交接连续性检查 ----
+
+
+class HandoffRelation(str, Enum):
+    """相邻批次时间轴关系：缺口 / 首尾相接 / 重叠。"""
+
+    GAP = "gap"
+    CONTIGUOUS = "contiguous"
+    OVERLAP = "overlap"
+
+
+class HandoffCheckCreate(BaseModel):
+    """运输交接连续性检查请求（只读，不产生任何持久化变更）。
+
+    - ``batch_refs`` 必须按**运输顺序**排列，至少两项且不得重复
+      （批次 ID 或业务批次号均可）；
+    - ``max_handoff_seconds`` 为允许的最大交接间隔（秒），必须为正数；
+      相邻批次缺口严格超过该值才判问题，等于上限可接受。
+    """
+
+    batch_refs: Annotated[
+        list[str],
+        Field(
+            min_length=2,
+            description="按运输顺序排列的批次引用（ID 或 external_ref）",
+        ),
+    ]
+    max_handoff_seconds: float = Field(
+        ...,
+        gt=0,
+        description="允许的最大交接间隔（秒）；缺口严格超过即标记问题",
+    )
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "batch_refs": ["TRUCK-A-001", "TRUCK-B-002"],
+                "max_handoff_seconds": 1800,
+            }
+        },
+    )
+
+    @field_validator("batch_refs")
+    @classmethod
+    def _validate_refs(cls, value: list[str]) -> list[str]:
+        for ref in value:
+            if not ref or not ref.strip():
+                raise ValueError("batch_refs must not contain blank values")
+        if len(set(value)) != len(value):
+            raise ValueError("batch_refs must not contain duplicates")
+        return value
+
+    @field_validator("max_handoff_seconds")
+    @classmethod
+    def _finite_interval(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("max_handoff_seconds must be a finite number")
+        return value
+
+
+class HandoffOut(BaseModel):
+    """一对相邻批次之间的交接检查结果。
+
+    ``gap_seconds`` 为下游开始时间减上游结束时间：正数表示缺口、0 表示
+    首尾相接、负数表示时间轴重叠。
+    """
+
+    index: int = Field(..., description="相邻对序号，从 1 开始")
+    upstream_ref: str = Field(..., description="上游批次引用（请求原值）")
+    downstream_ref: str = Field(..., description="下游批次引用（请求原值）")
+    upstream_end_time: datetime = Field(
+        ..., description="上游批次已审计时间轴结束时间"
+    )
+    downstream_start_time: datetime = Field(
+        ..., description="下游批次已审计时间轴开始时间"
+    )
+    gap_seconds: float = Field(
+        ..., description="交接间隔（秒）：正为缺口、0 相接、负为重叠"
+    )
+    overlap_seconds: float | None = Field(
+        ..., description="重叠秒数（仅重叠时为正，其余为 null）"
+    )
+    relation: HandoffRelation
+    upstream_tail_type: str = Field(
+        ..., description="上游批次末段类型（交接点上游一侧）"
+    )
+    downstream_head_type: str = Field(
+        ..., description="下游批次首段类型（交接点下游一侧）"
+    )
+    handoff_issue: bool = Field(
+        ...,
+        description="缺口超过阈值或任一侧片段为 missing 时为 true",
+    )
+    issue_reasons: list[str] = Field(
+        ...,
+        description=(
+            "问题原因：gap_exceeds_threshold / upstream_tail_missing / "
+            "downstream_head_missing；无问题时为空列表"
+        ),
+    )
+
+
+class HandoffCheckReport(BaseModel):
+    """整条运输路线的交接连续性检查结果（只读）。"""
+
+    batch_refs: list[str]
+    max_handoff_seconds: float
+    handoff_count: int
+    route_compliant: bool = Field(
+        ..., description="当且仅当所有相邻对均无交接问题时为 true"
+    )
+    handoffs: list[HandoffOut]
 
 
 def to_utc(value: datetime) -> datetime:

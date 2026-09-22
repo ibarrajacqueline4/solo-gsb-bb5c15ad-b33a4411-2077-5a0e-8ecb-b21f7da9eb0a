@@ -11,7 +11,10 @@ ISO 8601 时间戳的温度读数与允许区间，服务端：
    摘要进行**封存（seal）**，之后随时**校验（verify）**当前报告是否被篡改；
 6. 支持对批次进行**人工复核（review）**：待复核 → 通过/驳回，驳回后可重新
    打开再次复核；每次操作追加留痕，凭 `request_id` 幂等提交，且**不会改动
-   审计报告或封存/校验数据**。
+   审计报告或封存/校验数据**；
+7. 支持按**运输顺序**对多个批次做只读的**运输交接连续性检查**（
+   `POST /handoffs/check`）：逐对相邻批次报告交接间隔、缺口/重叠与交接点
+   两侧末/首段类型，缺口超过阈值或任一侧为缺测时标记交接问题。
 
 默认零配置：SQLite 文件库、WAL 模式、启动自动建表，**无需任何第三方账号**。
 
@@ -23,9 +26,10 @@ ISO 8601 时间戳的温度读数与允许区间，服务端：
 app/
   main.py       # FastAPI 入口、路由、启动初始化（lifespan 建表）
   audit.py      # 审计核心引擎：滞回状态机 + 缺测切片
+  handoffs.py   # 运输交接连续性检查引擎（纯函数：缺口/重叠/两侧片段类型）
   sealing.py    # canonical JSON 构造与 SHA-256 摘要
   schemas.py    # 请求/响应模型与参数校验
-  crud.py       # 批次写入、报告查询、封存校验与人工复核
+  crud.py       # 批次写入、报告查询、封存校验、人工复核与交接检查
   database.py   # sqlite3 连接、建表脚本、WAL/外键
   config.py     # 环境变量配置
 tests/          # pytest 引擎与 API 测试
@@ -124,6 +128,42 @@ requirements.txt
   seal/verify**——封存摘要保持不变、verify 结论不受复核影响。
 - 服务端以 `BEGIN IMMEDIATE` 在事务内先取写锁再判定状态，并发提交不会
   产生重复通过/重复事件。
+
+### 运输交接连续性检查（handoffs，只读）
+
+一批货物在联运过程中会先后形成多个冷链批次（换车、换承运商、换设备）。
+调用方按**实际运输顺序**提供批次引用列表（批次 ID 或业务批次号均可），
+服务端读取各批次**已审计时间轴**（报告中的 `start_time` / `end_time` 与
+首末片段类型），对相邻批次（上游 `i`、下游 `i+1`）计算：
+
+- 交接间隔 `gap_seconds = downstream.start_time − upstream.end_time`：
+  - `> 0`：存在**缺口**，`relation = "gap"`；
+  - `= 0`：首尾相接，`relation = "contiguous"`；
+  - `< 0`：两段时间轴**重叠**，`relation = "overlap"`，同时给出
+    正数的 `overlap_seconds = -gap_seconds`；
+- 交接点两侧片段类型：`upstream_tail_type`（上游批次**末段**类型）与
+  `downstream_head_type`（下游批次**首段**类型），取值为
+  `normal` / `high_excursion` / `low_excursion` / `missing`。
+
+当相邻对满足以下**任一**条件时 `handoff_issue = true`，并在
+`issue_reasons` 中给出原因（可叠加）：
+
+| 原因 | 触发条件 |
+| --- | --- |
+| `gap_exceeds_threshold` | 缺口**严格大于**允许交接间隔（等于上限可接受） |
+| `upstream_tail_missing` | 上游批次末段为 `missing` |
+| `downstream_head_missing` | 下游批次首段为 `missing` |
+
+重叠只如实报告，按上述规则不单独判问题（顺序传反会体现为重叠，调用方可
+据 `relation` 自行识别）。整条路线 `route_compliant` 当且仅当**所有**
+相邻对均无交接问题。
+
+该接口为**只读**：只查询 `batches` / `segments`，不写入或修改任何数据，
+既不影响审计报告，也不影响 seal/verify 与人工复核。参数约束：
+
+- 列表不足两项、含空值或重复批次（含 ID 与业务批次号指向同一批次）→ **422**；
+- 列表中任一引用不存在 → **404**；
+- `max_handoff_seconds` 必须为正数。
 
 ## 快速开始（Docker Compose）
 
@@ -298,6 +338,49 @@ curl http://localhost:8000/batches/TRUCK-A-001/review
 # }
 ```
 
+### `POST /handoffs/check` —— 运输交接连续性检查（只读）
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `batch_refs` | string 数组，必填 | 按**运输顺序**排列的批次引用（ID 或业务批次号），至少 2 项、不得重复 |
+| `max_handoff_seconds` | number，必填 | 允许的最大交接间隔（秒），必须为正数；缺口**严格超过**才判问题 |
+
+```bash
+curl -X POST http://localhost:8000/handoffs/check \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_refs": ["TRUCK-A-001", "TRUCK-B-002", "TRUCK-C-003"],
+    "max_handoff_seconds": 1800
+  }'
+```
+
+响应：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_refs` / `max_handoff_seconds` | 请求参数原样回显 |
+| `handoff_count` | 相邻对数量（批次数 − 1） |
+| `route_compliant` | 所有相邻对均无交接问题时为 `true` |
+| `handoffs[]` | 逐对相邻批次的检查结果，`index` 从 1 开始 |
+
+每个相邻对包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `upstream_ref` / `downstream_ref` | 上 / 下游批次引用（请求原值回显） |
+| `upstream_end_time` / `downstream_start_time` | 两侧已审计时间轴的结束/开始时间（UTC `Z`） |
+| `gap_seconds` | 交接间隔（秒）：正为缺口、0 相接、负为重叠 |
+| `overlap_seconds` | 重叠秒数（仅重叠时为正，其余 `null`） |
+| `relation` | `gap` / `contiguous` / `overlap` |
+| `upstream_tail_type` / `downstream_head_type` | 上游**末段** / 下游**首段**类型 |
+| `handoff_issue` | 缺口超阈值或任一侧为 `missing` 时为 `true` |
+| `issue_reasons` | 原因列表：`gap_exceeds_threshold`、`upstream_tail_missing`、`downstream_head_missing` |
+
+任一引用不存在返回 `404`；列表不足两项或含重复批次返回 `422`。结果只读，
+不改变既有报告、封存/校验与复核数据。
+
 ### `GET /batches` —— 批次列表（摘要）
 
 查询参数：`compliant=true|false`（可选过滤）、`limit`（1–200，默认 50）、
@@ -327,7 +410,11 @@ pytest -q
 幂等、verify 一致/篡改后 `valid=false` 且不改写审计数据、未封存与按 ID 定位；
 人工复核的合法/非法状态流转（409）、reject 必填 comment（422）、request_id
 幂等重放（200）与内容冲突（409）、历史按时间排序、按 ID 定位，以及复核全程
-不改动审计报告与 seal/verify 数据。
+不改动审计报告与 seal/verify 数据；运输交接检查的缺口（阈值内/等于阈值/
+超过阈值）、首尾相接、重叠及带符号间隔、两侧末/首段类型、missing 单侧或
+双侧问题原因叠加、多批次链路聚合与 `route_compliant`、引用不存在 404、
+不足两项/重复批次（含 ID 与业务批次号别名）/非法间隔 422、时区归一化、
+按 ID 定位，以及检查全程只读不改动报告、seal/verify 与复核数据。
 
 ## 设计说明
 
@@ -341,6 +428,11 @@ pytest -q
   幂等键内容冲突一律 409；事务以 `BEGIN IMMEDIATE` 串行化并发判定。复核数据
   与审计/封存数据物理分表，复核路径不写 `batches` / `readings` / `segments`
   / `batch_seals`，封存摘要与 verify 结论不受影响。
+- **交接检查**：检查逻辑为 `app/handoffs.py` 中的纯函数，只接收已审计时间轴
+  摘要（起止时间与首末片段类型），逐对相邻批次输出带符号交接间隔、关系与
+  问题原因，不依赖 Web/DB 框架、便于独立测试；接口层仅做引用解析与只读
+  查询（`batches` / `segments`），不新增表、不产生任何持久化写入，报告、
+  seal/verify 与复核三条既有路径完全不受影响。
 - **SQLite**：标准库 `sqlite3`，开启 WAL（并发读不阻塞写）与外键级联删除；
   批次、读数、片段、封存、复核事件五张表并建立索引；新表以幂等 DDL 在启动时
   创建，旧版本数据库升级无需手工迁移。

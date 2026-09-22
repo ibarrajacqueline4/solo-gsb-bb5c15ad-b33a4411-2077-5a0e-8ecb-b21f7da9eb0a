@@ -1,4 +1,4 @@
-"""数据库读写：批次提交（写入读数与审计片段）、报告查询、封存摘要与人工复核。"""
+"""数据库读写：批次提交（写入读数与审计片段）、报告查询、封存摘要、人工复核与交接检查。"""
 
 from __future__ import annotations
 
@@ -7,12 +7,20 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from . import audit, sealing
+from . import audit, handoffs, sealing
 from .schemas import BatchCreate, ReviewDecision, ReviewStatus, to_utc
 
 
 class DuplicateBatchError(Exception):
     """external_ref 已存在。"""
+
+
+class HandoffBatchNotFoundError(Exception):
+    """交接检查列表中的某个批次引用不存在。"""
+
+
+class HandoffDuplicateTargetError(Exception):
+    """交接检查列表中不同引用解析到了同一批次。"""
 
 
 class ReviewStateConflictError(Exception):
@@ -525,4 +533,98 @@ def get_review(
         "external_ref": batch_row["external_ref"],
         "status": status,
         "events": [_row_to_review_event(row) for row in event_rows],
+    }
+
+
+# ---- 运输交接连续性检查（只读） ----
+
+
+def _parse_utc(value: str) -> datetime:
+    """将持久化的带 Z ISO 8601 时间字符串解析为 UTC datetime。"""
+
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def check_handoffs(
+    conn: sqlite3.Connection,
+    batch_refs: list[str],
+    *,
+    max_handoff_seconds: float,
+) -> dict:
+    """读取各批次已审计时间轴并执行交接连续性检查。
+
+    纯只读：不写入批次、读数、片段、封存或复核任何一张表。
+
+    - 任一引用无法定位批次抛 :class:`HandoffBatchNotFoundError`（调用方
+      映射为 404）；
+    - 不同引用解析到同一批次（ID 与 external_ref 混用指向同一批）抛
+      :class:`HandoffDuplicateTargetError`（调用方映射为 422）。
+    """
+
+    timelines: list[handoffs.BatchTimeline] = []
+    resolved_ids: set[str] = set()
+    for ref in batch_refs:
+        batch_row = _fetch_batch_row(conn, ref)
+        if batch_row is None:
+            raise HandoffBatchNotFoundError(ref)
+        if batch_row["id"] in resolved_ids:
+            raise HandoffDuplicateTargetError(ref)
+        resolved_ids.add(batch_row["id"])
+
+        # 首段与末段：交接检查只关心交接点两侧紧邻片段的类型。
+        first_segment = conn.execute(
+            """
+            SELECT type FROM segments
+            WHERE batch_id = ? ORDER BY idx ASC LIMIT 1
+            """,
+            (batch_row["id"],),
+        ).fetchone()
+        last_segment = conn.execute(
+            """
+            SELECT type FROM segments
+            WHERE batch_id = ? ORDER BY idx DESC LIMIT 1
+            """,
+            (batch_row["id"],),
+        ).fetchone()
+        assert first_segment is not None and last_segment is not None
+        timelines.append(
+            handoffs.BatchTimeline(
+                ref=ref,
+                start_time=_parse_utc(batch_row["start_time"]),
+                end_time=_parse_utc(batch_row["end_time"]),
+                first_segment_type=first_segment["type"],
+                last_segment_type=last_segment["type"],
+            )
+        )
+
+    report = handoffs.check_handoffs(
+        timelines, max_handoff_seconds=max_handoff_seconds
+    )
+
+    return {
+        "batch_refs": batch_refs,
+        "max_handoff_seconds": max_handoff_seconds,
+        "handoff_count": len(report.handoffs),
+        "route_compliant": report.route_compliant,
+        "handoffs": [
+            {
+                "index": item.index,
+                "upstream_ref": item.upstream_ref,
+                "downstream_ref": item.downstream_ref,
+                "upstream_end_time": item.upstream_end_time,
+                "downstream_start_time": item.downstream_start_time,
+                "gap_seconds": item.gap_seconds,
+                "overlap_seconds": (
+                    round(-item.gap_seconds, 3)
+                    if item.relation == handoffs.OVERLAP
+                    else None
+                ),
+                "relation": item.relation,
+                "upstream_tail_type": item.upstream_tail_type,
+                "downstream_head_type": item.downstream_head_type,
+                "handoff_issue": item.handoff_issue,
+                "issue_reasons": list(item.issue_reasons),
+            }
+            for item in report.handoffs
+        ],
     }
