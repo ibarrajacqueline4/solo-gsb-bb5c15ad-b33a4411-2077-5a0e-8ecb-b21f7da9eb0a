@@ -20,6 +20,8 @@ from .schemas import (
     BatchReport,
     BatchReview,
     BatchSeal,
+    HandoffCheckRequest,
+    HandoffCheckResponse,
     ReviewCreate,
     ReviewEventOut,
     SealVerification,
@@ -35,14 +37,17 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="冷链温度合规审计 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "提交按批次组织的 ISO 时间戳温度读数，服务端排序后使用滞回阈值"
         "识别连续超温事件，并将超过采样间隔上限的缺测切成独立片段；"
         "支持对审计报告按固定字段顺序生成 canonical JSON 并以 SHA-256"
         "封存摘要（seal），随后可重新计算摘要进行一致性校验（verify）；"
         "另支持批次人工复核工作流（pending → approved/rejected → "
-        "reopen），复核事件追加留痕，不改动审计报告与封存数据。"
+        "reopen），复核事件追加留痕，不改动审计报告与封存数据；"
+        "还可对按运输顺序排列的多个批次做运输交接连续性检查"
+        "（POST /handoffs/check），报告相邻批次间的缺口、重叠与两侧"
+        "末/首段类型，全程只读。"
     ),
     lifespan=lifespan,
 )
@@ -100,6 +105,49 @@ def list_batches(
         conn, compliant=compliant, limit=limit, offset=offset
     )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.post(
+    "/handoffs/check",
+    response_model=HandoffCheckResponse,
+    tags=["handoffs"],
+    summary="运输交接连续性检查（按运输顺序校验相邻批次，只读）",
+)
+def check_handoffs(
+    payload: HandoffCheckRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """逐对检查“前一批 end_time → 后一批 start_time”的交接连续性。
+
+    读取各批次**已审计时间轴**，按给定运输顺序比较相邻批次：
+
+    - 报告有符号 ``interval_seconds``，以及非负的 ``gap_seconds``（缺口）
+      与 ``overlap_seconds``（重叠）；
+    - 同时给出前一批**末段**与后一批**首段**的类型与 missing 标记；
+    - 缺口**严格大于** ``allowed_gap_seconds``，或任一侧相接片段为
+      ``missing`` 时标记 ``handoff_issue`` 并附 ``issue_reasons``；
+    - ``route_compliant`` 当且仅当所有交接均无问题。
+
+    全程只读，不改变审计报告、封存（seal/verify）与人工复核数据。
+    列表不足两项或含重复批次返回 422；引用不存在的批次返回 404。
+    """
+
+    try:
+        return crud.check_handoffs(
+            conn,
+            payload.batch_refs,
+            allowed_gap_seconds=payload.allowed_gap_seconds,
+        )
+    except crud.BatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"batch not found: {exc}",
+        )
+    except crud.DuplicateHandoffBatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"batch_refs must not reference the same batch twice: {exc}",
+        )
 
 
 @app.get(

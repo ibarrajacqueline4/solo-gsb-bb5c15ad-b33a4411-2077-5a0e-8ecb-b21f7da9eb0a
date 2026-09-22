@@ -7,12 +7,20 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from . import audit, sealing
+from . import audit, handoffs, sealing
 from .schemas import BatchCreate, ReviewDecision, ReviewStatus, to_utc
 
 
 class DuplicateBatchError(Exception):
     """external_ref 已存在。"""
+
+
+class BatchNotFoundError(Exception):
+    """交接检查中引用的批次不存在（参数为调用方提供的 batch_ref）。"""
+
+
+class DuplicateHandoffBatchError(Exception):
+    """交接检查中多个引用解析到了同一批次（参数为重复批次的标识）。"""
 
 
 class ReviewStateConflictError(Exception):
@@ -525,4 +533,120 @@ def get_review(
         "external_ref": batch_row["external_ref"],
         "status": status,
         "events": [_row_to_review_event(row) for row in event_rows],
+    }
+
+
+# ---- 运输交接连续性检查（只读）----
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """解析持久化的带 Z ISO 8601 时间字符串为 UTC datetime。"""
+
+    return to_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
+def _load_timeline(
+    conn: sqlite3.Connection, batch_row: sqlite3.Row
+) -> handoffs.BatchTimeline:
+    """读取一个批次的边界时间与按时间轴排序的首/末片段。只读。"""
+
+    batch_id = batch_row["id"]
+    first_row = conn.execute(
+        """
+        SELECT * FROM segments
+        WHERE batch_id = ?
+        ORDER BY start_time ASC, idx ASC
+        LIMIT 1
+        """,
+        (batch_id,),
+    ).fetchone()
+    last_row = conn.execute(
+        """
+        SELECT * FROM segments
+        WHERE batch_id = ?
+        ORDER BY end_time DESC, idx DESC
+        LIMIT 1
+        """,
+        (batch_id,),
+    ).fetchone()
+    # 片段由审计引擎保证至少一个；写时审计不可能产生空时间轴。
+    assert first_row is not None and last_row is not None
+
+    return handoffs.BatchTimeline(
+        id=batch_id,
+        external_ref=batch_row["external_ref"],
+        start_time=_parse_timestamp(batch_row["start_time"]),
+        end_time=_parse_timestamp(batch_row["end_time"]),
+        first_segment_type=first_row["type"],
+        first_segment_missing=bool(first_row["missing"]),
+        last_segment_type=last_row["type"],
+        last_segment_missing=bool(last_row["missing"]),
+    )
+
+
+def check_handoffs(
+    conn: sqlite3.Connection,
+    batch_refs: list[str],
+    allowed_gap_seconds: float,
+) -> dict:
+    """按运输顺序检查相邻批次的交接连续性。
+
+    纯只读：不写入或修改批次、读数、片段、封存与复核数据。
+
+    - 任一引用（ID 或 external_ref）不存在抛 :class:`BatchNotFoundError`；
+    - 多个引用解析到同一批次抛 :class:`DuplicateHandoffBatchError`；
+    - 其余输入约束（至少两项、字符串重复）由请求模型保证。
+    """
+
+    timelines: list[handoffs.BatchTimeline] = []
+    seen_ids: set[str] = set()
+    for batch_ref in batch_refs:
+        batch_row = _fetch_batch_row(conn, batch_ref)
+        if batch_row is None:
+            raise BatchNotFoundError(batch_ref)
+        if batch_row["id"] in seen_ids:
+            raise DuplicateHandoffBatchError(
+                f"{batch_ref} -> {batch_row['external_ref']}"
+            )
+        seen_ids.add(batch_row["id"])
+        timelines.append(_load_timeline(conn, batch_row))
+
+    verdicts = handoffs.evaluate_handoffs(timelines, allowed_gap_seconds)
+
+    return {
+        "batch_refs": batch_refs,
+        "allowed_gap_seconds": allowed_gap_seconds,
+        "handoff_count": len(verdicts),
+        "issue_count": sum(1 for v in verdicts if v.handoff_issue),
+        "route_compliant": handoffs.route_is_compliant(verdicts),
+        "handoffs": [_verdict_to_dict(verdict) for verdict in verdicts],
+    }
+
+
+def _verdict_to_dict(verdict: handoffs.HandoffVerdict) -> dict:
+    left = verdict.from_timeline
+    right = verdict.to_timeline
+    return {
+        "index": verdict.index,
+        "from_batch": {
+            "batch_id": left.id,
+            "external_ref": left.external_ref,
+            "boundary_time": left.end_time,
+            "segment_type": left.last_segment_type,
+            "segment_missing": left.last_segment_missing,
+        },
+        "to_batch": {
+            "batch_id": right.id,
+            "external_ref": right.external_ref,
+            "boundary_time": right.start_time,
+            "segment_type": right.first_segment_type,
+            "segment_missing": right.first_segment_missing,
+        },
+        "from_end_time": left.end_time,
+        "to_start_time": right.start_time,
+        "interval_seconds": verdict.interval_seconds,
+        "gap_seconds": verdict.gap_seconds,
+        "overlap_seconds": verdict.overlap_seconds,
+        "handoff_issue": verdict.handoff_issue,
+        "issue_reasons": list(verdict.issue_reasons),
     }
